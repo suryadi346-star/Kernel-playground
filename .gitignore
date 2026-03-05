@@ -1,0 +1,35 @@
+# Kernel build artifacts
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+modules.builtin
+modules.builtin.modinfo
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Assembly binaries
+asm/x86/*.o
+asm/x86/syscall_write
+asm/arm/*.o
+asm/arm/syscall_write
+
+# CI/CD — cloned during build, do not commit
+linux-src/
+AnyKernel3/
+modules/lib/
+
+# Build output ZIPs
+Kernel-Playground-ARM64-*.zip
+build-info.txt
+
+# Editor & OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
