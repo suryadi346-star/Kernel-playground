@@ -1,0 +1,196 @@
+name: Kernel Playground Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      ARCH: arm64
+      CCACHE_DIR: /home/runner/.cache/ccache
+      CROSS_COMPILE: aarch64-linux-gnu-
+
+    steps:
+      # 1. Checkout repo
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Setup ccache
+      - name: Setup ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache
+          echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+          ccache --set-config=cache_dir=${CCACHE_DIR}
+          ccache --clear
+
+      # 3. Restore ccache cache
+      - name: Restore ccache cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: kernel-ccache-${{ github.sha }}
+          restore-keys: |
+            kernel-ccache-
+
+      # 4. Install dependencies
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            build-essential \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            dwarves \
+            git \
+            make \
+            python3 \
+            rsync \
+            kmod \
+            cpio
+
+      # 5. Clone Android Common Kernel GKI 5.10
+      - name: Clone Android Common Kernel
+        run: |
+          echo "[*] Cloning ACK GKI 5.10..."
+          rm -rf linux-src
+          git clone --depth=1 --branch android12-5.10 \
+            https://android.googlesource.com/kernel/common linux-src
+
+      # 6. Initial ccache stats
+      - name: Show ccache stats before build
+        run: ccache -s
+
+      # 7. Configure kernel
+      - name: Configure kernel
+        working-directory: linux-src
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+
+          # Disable key enforcement
+          ./scripts/config --disable CONFIG_SYSTEM_TRUSTED_KEYS
+          ./scripts/config --disable CONFIG_SYSTEM_REVOCATION_KEYS
+          ./scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
+          ./scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
+
+          # Ensure Image.gz is produced
+          ./scripts/config --enable CONFIG_KERNEL_GZIP
+
+          # Common performance tweaks
+          ./scripts/config --enable CONFIG_BPF
+          ./scripts/config --set-val CONFIG_HZ 1000
+
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+      # 8. Start build timer
+      - name: Start build timer
+        run: echo "time_start=$(date +%s)" >> $GITHUB_ENV
+
+      # 9. Build Kernel
+      - name: Build kernel image
+        working-directory: linux-src
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache aarch64-linux-gnu-gcc" \
+            -j$(nproc) Image.gz
+
+          if [ ! -f "arch/arm64/boot/Image.gz" ]; then
+            echo "Image.gz not found! Build failed."
+            exit 1
+          fi
+
+      # 10. Build modules
+      - name: Build kernel modules
+        working-directory: linux-src
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache aarch64-linux-gnu-gcc" \
+            -j$(nproc) modules
+
+          mkdir -p ../modules
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH=../modules modules_install
+
+      # 11. Final ccache stats
+      - name: Show ccache stats after build
+        run: ccache -s
+
+      # 12. Prepare AnyKernel3
+      - name: Prepare AnyKernel3
+        run: |
+          rm -rf AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+
+          rm -rf AnyKernel3/modules
+          mkdir -p AnyKernel3/modules
+
+      # 13. Copy kernel files to AnyKernel3
+      - name: Copy kernel files
+        run: |
+          cp linux-src/arch/arm64/boot/Image.gz AnyKernel3/
+
+          if find modules -name "*.ko" | grep -q .; then
+            mkdir -p AnyKernel3/modules/system/lib
+            cp -r modules/lib/modules AnyKernel3/modules/system/lib/
+            find AnyKernel3/modules -type l ! -exec test -e {} \; -delete
+          fi
+
+          ls -la AnyKernel3/
+          find AnyKernel3/modules -name "*.ko" | head -5
+
+      # 14. Create flashable ZIP
+      - name: Create flashable ZIP
+        run: |
+          KERNEL_VERSION=$(grep -Po 'CONFIG_LOCALVERSION="\K[^"]*' linux-src/.config || echo "custom")
+          DATE=$(date +%Y%m%d)
+
+          echo "kernel.string=Kernel Playground - $KERNEL_VERSION - $DATE" >> AnyKernel3/anykernel.sh
+          echo "build.date=$(date)" >> AnyKernel3/anykernel.sh
+
+          cd AnyKernel3
+          zip -r9 ../Kernel-Playground-ARM64-$DATE.zip ./* -x "*.git*"
+
+      # 15. End build timer and calculate duration
+      - name: Calculate build time
+        run: |
+          end=$(date +%s)
+          start=${{ env.time_start }}
+          dur=$((end - start))
+          echo "BUILD_TIME=$dur" >> $GITHUB_ENV
+          echo "Build completed in $dur seconds"
+
+      # 16. Upload artifacts
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build-${{ github.run_number }}
+          path: |
+            Kernel-Playground-ARM64-*.zip
+            linux-src/arch/arm64/boot/Image.gz
+            modules/lib/modules/
+          retention-days: 7
+
+      # 17. Upload build info
+      - name: Upload build info
+        if: always()
+        run: |
+          {
+            echo "Build Information:"
+            echo "=================="
+            echo "Workflow: ${{ github.workflow }}"
+            echo "Run ID: ${{ github.run_id }}"
+            echo "Commit: ${{ github.sha }}"
+            echo "Build Time: ${{ env.BUILD_TIME }} seconds"
+            echo "Date: $(date)"
+            echo ""
+            echo "Kernel Configuration:"
+            grep "^CONFIG_LOCALVERSION=" linux-src/.config || true
+          } > build-info.txt
